@@ -11,6 +11,9 @@ import { runFileAgent } from './src/server/guild.ts';
 import { Store } from './src/server/store.ts';
 import { checkRefund, executeRefund, makeApproval, digest, log, draftRefund } from './src/server/engine.ts';
 import { speakerStatus, encodeVoice, verifyEnrollment, transcribeLocal, validateWav, transcribe } from './src/server/providers.ts';
+import { startSession, followUp, waitReply, parseAction, guildConfigured } from './src/server/guild.ts';
+import type { AgentAction } from './src/server/guild.ts';
+import { safePath, createFile, deleteFile } from './src/server/files.ts';
 import type { AppState, RefundAction } from './src/shared/types.ts';
 const port=Number(process.env.PORT || 3000), origin=process.env.APP_ORIGIN || `http://localhost:${port}`, rpID=new URL(origin).hostname;
 if(!['localhost','127.0.0.1'].includes(rpID))throw new Error('This prototype only supports a localhost origin. Production identity provisioning is not implemented.');
@@ -43,7 +46,7 @@ async function state(key:string):Promise<AppState> {
   const ws=await store.get(key),speaker=await speakerStatus();
   const {profile}=ws;
   return {revision:ws.revision,orders:ws.orders,policy:ws.policy,actions:ws.actions.filter(a=>!a.requiresVoice),audit:ws.audit,profile:{userId:profile.userId,name:profile.name,hasPasskey:!!profile.credential,voices:profile.voices.map(({embedding:_embedding,transcript,...v})=>({...v,transcript:(authenticated.get(key)??0)>Date.now()?transcript:undefined}))},
-    authenticated:(authenticated.get(key)??0)>Date.now(),integrations:{mongodb:{mode:store.mode,connected:true},elevenlabs:{configured:!!process.env.ELEVENLABS_API_KEY},speaker}};
+    authenticated:(authenticated.get(key)??0)>Date.now(),integrations:{mongodb:{mode:store.mode,connected:true},elevenlabs:{configured:!!process.env.ELEVENLABS_API_KEY},guild:{configured:guildConfigured()},speaker}};
 }
 app.post('/api/users',async(req,res)=>{
   z.object({name:z.literal('Jordan Example').optional()}).parse(req.body??{});
@@ -169,6 +172,33 @@ app.post('/api/actions/:id/execute',async(req,res)=>{
   catch(error){await store.update(key,ws=>log(ws,'Execution blocked',error instanceof Error?error.message:'Request denied.'));throw error;}
   res.json(await state(key));
 });
+// Voice-gated Guild agent: the agent proposes, Alink fixes the action server-side and runs it only after voice verification.
+const pendingAgent=new Map<string,{sessionId:string;lastEventId:string;action:AgentAction;expires:number}>();
+app.post('/api/agent/command',raw,async(req,res)=>{
+  if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
+  if(!guildConfigured())throw new Error('Guild is not configured. Set the GUILD_* variables in .env.');
+  const key=owner(req),transcript=await transcribeLocal(audio(req));
+  if(!transcript?.trim())throw new Error('Request transcription unavailable or no speech recognized. Start the local voice service and record your message again.');
+  const sessionId=await startSession(transcript),reply=await waitReply(sessionId),action=parseAction(reply.text);
+  const needsVoice=action.action!=='none';
+  if(needsVoice){if(!action.filename)throw new Error('The agent did not name a file.');safePath(action.filename);pendingAgent.set(key,{sessionId,lastEventId:reply.eventId,action,expires:Date.now()+120000});}
+  else pendingAgent.delete(key);
+  await store.update(key,ws=>log(ws,'Agent command received',needsVoice?`Guild agent proposed ${action.action} ${action.filename}; awaiting voice authentication.`:'Guild agent proposed no file action.'));
+  res.json({transcript,agentMessage:action.message,action:{type:action.action,filename:action.filename??null},needsVoice});
+});
+app.post('/api/agent/approve',raw,async(req,res)=>{
+  if(req.headers['x-recording-consent']!=='yes')throw new Error('Consent to process this recording required.');
+  const key=owner(req),bytes=audio(req),variation=pitchVariation(req.query.pitch??req.query.variation??'normal'),pending=pendingAgent.get(key);pendingAgent.delete(key);
+  if(!pending||pending.expires<Date.now())throw new Error('No pending agent action. Send a command first.');
+  const ws=await store.get(key),[embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
+  const voice=verifyEnrollment(embedding,transcript,ws.profile.voices,variation),approved=voice.status==='consistent',{action}=pending;
+  let outcome='Not executed: voice authentication failed.';
+  if(approved){try{outcome=action.action==='create'?await createFile(action.filename!,action.content??''):await deleteFile(action.filename!);}catch(error){outcome='Failed: '+(error instanceof Error?error.message:'file operation error.');}}
+  await store.update(key,w=>log(w,approved?'Agent action approved by voice':'Agent action rejected by voice',`${action.action} ${action.filename} · ${outcome}`));
+  let agentMessage=outcome;
+  try{await followUp(pending.sessionId,`ALINK_RESULT: voice=${approved?'passed':'failed'}; ${outcome}`);agentMessage=parseAction((await waitReply(pending.sessionId,pending.lastEventId)).text).message;}catch{/* the local outcome is authoritative */}
+  res.json({voice,approved,outcome,agentMessage});
+});
 app.use('/api',(_req,res)=>{res.status(404).json({error:'API endpoint not found.'});});
 const server=createServer(app);
 const vite=process.argv.includes('--dev')?await(await import('vite')).createServer({server:{middlewareMode:true,ws:{server}},appType:'spa'}):null;
@@ -178,6 +208,10 @@ app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.N
   res.status(error instanceof ApiError?error.status:400).json({error:message});
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Alink: ${origin} · storage=${store.mode} · local prototype, simulated refunds`));
+<<<<<<< HEAD
 const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of fileRequests)if(v.expires<now)fileRequests.delete(key);for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
+=======
+const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);for(const [key,v]of pendingAgent)if(v.expires<now)pendingAgent.delete(key);},60000);cleanup.unref();
+>>>>>>> origin/main
 async function stop(){clearInterval(cleanup);await vite?.close();server.close(async()=>{await store.close();process.exit(0);});}
 process.on('SIGINT',()=>void stop());process.on('SIGTERM',()=>void stop());
