@@ -9,7 +9,7 @@ export function newWorkspace(): Workspace {
 }
 export function log(ws: Workspace, event: string, detail: string) { ws.audit.unshift({ id: randomUUID(), time: new Date().toISOString(), event, detail }); ws.audit = ws.audit.slice(0,150); }
 export function digest(action: RefundAction) {
-  return createHash('sha256').update(JSON.stringify([action.id, action.orderId, action.amountCents, action.currency, action.destination, action.policyVersion, action.expiresAt])).digest('hex');
+  return createHash('sha256').update(JSON.stringify([action.id, action.orderId, action.amountCents, action.currency, action.destination, action.policyVersion, action.expiresAt, action.requiresVoice===true])).digest('hex');
 }
 export function checkRefund(ws: Workspace, action: RefundAction, now = Date.now()): string | null {
   const order = ws.orders.find(o => o.id === action.orderId);
@@ -24,9 +24,10 @@ export function checkRefund(ws: Workspace, action: RefundAction, now = Date.now(
   if (ws.policy.originalMethodOnly && action.destination !== order.paymentMethod) return 'Refunds must return to the original payment method.';
   return null;
 }
-export function executeRefund(ws: Workspace, actionId: string, approvalId: string, now = Date.now()): RefundAction {
+export function executeRefund(ws: Workspace, actionId: string, approvalId: string, now = Date.now(), voiceProof?: BankVoiceProof): RefundAction {
   const action = ws.actions.find(a => a.id === actionId);
   if (!action) throw new Error('Action not found.');
+  requireBankVoice(ws,action,voiceProof,now);
   const denial = checkRefund(ws, action, now); if (denial) throw new Error(denial);
   // Live mock execution always requires a passkey proof, even before policy repair.
   const approval = ws.approvals.find(a => a.id === approvalId && a.actionId === actionId);
@@ -88,4 +89,10 @@ export function draftRefund(text:string):{orderId:string;amountCents:number;dest
   if(original===external)throw new Error('Specify either original card or external account. Ambiguous requests require manual review.');
   if(!Number.isFinite(dollars)||dollars<=0)throw new Error('Invalid refund amount.');
   return {orderId:'ORD-1042',amountCents:Math.round(dollars*100),destination:original?'original-card-4242':'external-account',source:'reviewed-transcript'};
+}
+
+export interface BankVoiceProof { digest:string; profileDigest:string; expires:number }
+export function voiceProfileDigest(ws:Workspace) { return createHash('sha256').update(JSON.stringify(ws.profile.voices)).digest('hex'); }
+export function requireBankVoice(ws:Workspace,action:RefundAction,proof:BankVoiceProof|undefined,now=Date.now()) {
+  if(action.requiresVoice && (!proof||proof.expires<=now||proof.digest!==digest(action)||proof.profileDigest!==voiceProfileDigest(ws)))throw new Error('A fresh speaker and full-phrase match for this transaction is required.');
 }

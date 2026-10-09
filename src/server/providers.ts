@@ -71,3 +71,38 @@ export async function scanConnector():Promise<DoctorReport['codeScan']> {
     return {status:'complete',findings:report.results.map(r=>({rule:r.check_id,path:r.path,line:r.start.line,message:r.extra.message})),message:'Actual Semgrep scan of deliberately vulnerable and repaired fixture connectors.'};
   }catch{return {status:'unavailable',findings:[],message:'Semgrep is unavailable or failed. Install it and run the scan again; no code findings are fabricated.'};}
 }
+
+export const EXPECTED_PHRASE = 'The rain in Spain falls mainly on the plain';
+function normalizedWords(text:string) { return text.toLowerCase().normalize('NFKC').replace(/[^a-z0-9\s]/g,' ').trim().split(/\s+/).filter(Boolean).join(' '); }
+export function checkPhrase(transcript:string|null,expected=EXPECTED_PHRASE):import('../shared/types.ts').PhraseCheck {
+  if(transcript===null)return {status:'unavailable',expected,transcript:null,message:'Local transcription unavailable. Start the updated voice service with its Vosk model installed.'};
+  const matched=normalizedWords(transcript)===normalizedWords(expected);
+  return {status:matched?'matched':'mismatch',expected,transcript,message:matched?'All expected words match in order.':'Phrase did not match. Say the complete displayed phrase once; check the transcript for recognition errors.'};
+}
+export function combineVoiceAndPhrase(speaker:VoiceResult,transcript:string|null):VoiceResult {
+  const phrase=checkPhrase(transcript),speakerStatus=speaker.status;
+  const status=speakerStatus==='unavailable'||phrase.status==='unavailable'?'unavailable':speakerStatus==='consistent'&&phrase.status==='matched'?'consistent':'uncertain';
+  return {...speaker,speakerStatus,phrase,status,message:status==='consistent'?'Speaker and complete phrase are consistent. This is not liveness or deepfake verification.':speakerStatus==='unavailable'?speaker.message:phrase.status!=='matched'?phrase.message:speaker.message};
+}
+export async function transcribeLocal(audio:Buffer):Promise<string|null> {
+  try {
+    const res=await fetch(voiceURL()+'/transcribe',{method:'POST',headers:{'Content-Type':'audio/wav'},body:new Uint8Array(audio),signal:AbortSignal.timeout(90000)});
+    if(!res.ok)return null;
+    return z.object({text:z.string().max(10000)}).parse(await res.json()).text;
+  }catch{return null;}
+}
+
+// Select one baseline phrase, then compare only recordings carrying that same text.
+// Do not combine text from one sample with speaker evidence from another phrase.
+export function verifyEnrollment(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[]):VoiceResult {
+  const baseline=samples.find(s=>s.variation==='natural'&&s.embedding&&s.model===candidate?.model&&s.embedding.length===candidate?.embedding.length&&s.transcript&&normalizedWords(s.transcript));
+  if(!candidate)return combineVoiceAndPhrase(compareVoice(candidate,samples),transcript);
+  if(!baseline){
+    const speaker=compareVoice(candidate,[]);
+    return {...speaker,speakerStatus:'unavailable',phrase:{status:'unavailable',expected:'',transcript,message:'No complete stored baseline.'},message:'No compatible natural baseline with both transcript and embedding. Verify your passkey and save a new natural sample.'};
+  }
+  const references=samples.filter(s=>s.transcript&&normalizedWords(s.transcript)===normalizedWords(baseline.transcript!));
+  const speaker=compareVoice(candidate,references),phrase=checkPhrase(transcript,baseline.transcript!),speakerStatus=speaker.status;
+  const status=speakerStatus==='unavailable'||phrase.status==='unavailable'?'unavailable':speakerStatus==='consistent'&&phrase.status==='matched'?'consistent':'uncertain';
+  return {...speaker,baselineSampleId:baseline.id,speakerStatus,phrase,status,message:status==='consistent'?'Verification successful. Speaker and spoken text match the stored enrollment baseline.':status==='unavailable'?'Verification unavailable. '+(phrase.status==='unavailable'?phrase.message:speaker.message):'Verification failure. '+(phrase.status==='mismatch'?'The spoken words differ from the stored baseline.':speaker.message)};
+}

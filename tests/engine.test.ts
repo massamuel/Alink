@@ -15,3 +15,23 @@ test('remaining paid balance prevents multiple approved requests overdrawing ord
 test('fractional cents, invalid order, and wrong currency rejected',()=>{const {ws,action}=setup();action.amountCents=0.5;assert.match(checkRefund(ws,action)!,/integer cents/);action.amountCents=5000;action.orderId='unknown';assert.match(checkRefund(ws,action)!,/not eligible/);});
 
 test('transcript planner prepares fields but refuses ambiguous amounts or destinations',()=>{assert.equal(draftRefund('Refund fifty dollars to the original card').amountCents,5000);assert.equal(draftRefund('Refund $20 to the external account').destination,'external-account');assert.throws(()=>draftRefund('Refund fifty dollars or twenty dollars to the original card'));assert.throws(()=>draftRefund('Refund $50 to the original card and external account'));});
+
+test('bank transaction requires matching unexpired voice proof even with valid passkey approval',async()=>{
+  const {digest,voiceProfileDigest}=await import('../src/server/engine.ts');
+  const {ws,action,approval}=setup();action.requiresVoice=true;approval.digest=digest(action);
+  assert.throws(()=>executeRefund(ws,action.id,approval.id),/speaker and full-phrase/);
+  const proof={digest:digest(action),profileDigest:voiceProfileDigest(ws),expires:Date.now()+60000};
+  assert.throws(()=>executeRefund(ws,action.id,approval.id,Date.now(),{...proof,expires:Date.now()-1}),/speaker and full-phrase/);
+  assert.throws(()=>executeRefund(ws,action.id,approval.id,Date.now(),{...proof,digest:'another-action'}),/speaker and full-phrase/);
+  ws.profile.voices.push({id:'new-sample',variation:'natural',createdAt:'',bytes:1,embedding:[1,0],model:'test'});
+  assert.throws(()=>executeRefund(ws,action.id,approval.id,Date.now(),proof),/speaker and full-phrase/);
+  const current={...proof,profileDigest:voiceProfileDigest(ws)};
+  assert.equal(executeRefund(ws,action.id,approval.id,Date.now(),current).status,'executed');
+  assert.throws(()=>executeRefund(ws,action.id,approval.id,Date.now(),current),/already executed/);
+});
+test('changing bank voice requirement invalidates an existing approval',async()=>{
+  const {ws,action,approval}=setup();action.requiresVoice=true;
+  const {digest,voiceProfileDigest}=await import('../src/server/engine.ts');
+  const proof={digest:digest(action),profileDigest:voiceProfileDigest(ws),expires:Date.now()+60000};
+  assert.throws(()=>executeRefund(ws,action.id,approval.id,Date.now(),proof),/details changed/);
+});

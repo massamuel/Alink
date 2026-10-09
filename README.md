@@ -58,6 +58,7 @@ Use Python 3.10–3.12. Install the pinned compatible Torch/SpeechBrain requirem
 ```sh
 python3.11 -m venv .venv
 .venv/bin/pip install -r voice-service/requirements.txt
+.venv/bin/python voice-service/download_asr.py
 .venv/bin/uvicorn app:app --app-dir voice-service --host 127.0.0.1 --port 8001
 ```
 
@@ -114,3 +115,23 @@ Doctor → policy replay + Semgrep fixture scan → review → passkey → polic
 Localhost only. Session cookie possession identifies a local demo workspace; initial enrollment is first-use profile provisioning. There is no verified bank identity, production account recovery, public hosting, phone-call interception, OAuth connector, or general vulnerability discovery. A real deployment needs authenticated identity provisioning and recovery, transport security, tenancy and role separation, durable session management, protected approval displays, deployment-specific biometric consent/retention, and actual provider integration tests. Voice is not relied on as a banking authenticator. Neither model consistency nor these tests establish production security.
 
 Never commit `.env`, recordings, embeddings, credentials, or `.data`. The existing AgentPermissionsDoctor repository is separate and unchanged.
+
+## Speaker plus phrase verification
+
+Verification now transcribes the **same WAV clip** locally using Vosk and compares it to “The rain in Spain falls mainly on the plain”. A passing result requires both compatible natural-speaker embeddings above the prototype threshold and the complete phrase in order. Case, punctuation, and whitespace are ignored; missing, changed, reordered, or extra words fail. Say the phrase once, without an introduction. No expected-phrase grammar or prompt is given to the recognizer.
+
+Install the updated Python requirements and run `.venv/bin/python voice-service/download_asr.py`, then restart **both** the voice service and the Alink server. The health endpoint includes `transcriptionReady`. If transcription is offline or errors, verification is unavailable rather than a voice-only pass. Existing embedding-ready natural enrollment can still be used; no re-enrollment is needed just for this feature.
+
+The result shows expected text, recognized text, and separate speaker/phrase outcomes. Recognition errors can cause false rejection; inspect the transcript and retry in a quiet room. Matching a fixed phrase does not establish liveness or prevent playback of a complete recording. Refund approval still requires a passkey. Verification audio/transcript are not persisted or sent to ElevenLabs by this feature.
+
+## ElevenLabs bank voice agent
+
+Open **Bank voice agent** for the selected demo client's amount → voice/phrase verification → exact-action passkey → simulated approval popup workflow. Configure your ElevenLabs voice agent using [docs/BANK_AGENT.md](docs/BANK_AGENT.md), then add `ELEVENLABS_AGENT_ID` alongside `ELEVENLABS_API_KEY` in `.env`. Restart Alink to load these values. The API key stays on the server. The page offers a manual amount entry to test the same backend checks before provider setup. This is still the sample original-card refund, not a real banking connector. Live provider conversation testing requires your configured agent and credentials.
+
+## Stored baseline text verification
+
+Enrollment now stores the locally extracted `transcript` alongside the same sample's recording, embedding, model, and ID in the profile (MongoDB when configured, otherwise the local store). New enrollment is rejected if either embedding extraction or transcription fails; “saved” means both are present. Verification uses the first compatible natural sample with stored text as the phrase baseline and compares embeddings only from recordings with that same normalized transcript. It never combines a matching phrase from one enrollment with speaker evidence from a different phrase.
+
+The displayed expected phrase comes from that stored baseline. Punctuation/capitalization/whitespace are ignored; missing, extra, reordered or changed words fail. A successful result requires both transcript equality and speaker similarity above the experimental threshold. The UI shows **Verification successful**, **Verification failure**, or **Verification unavailable**, with separate evidence. This compares speaker characteristics, not byte-identical audio. Both voice and phrase recognition can make errors; this is not liveness verification.
+
+Older samples without transcripts remain visible but cannot form a complete baseline. Verify your passkey and record a new natural baseline with the updated speaker/transcription service running. The app does not silently retranscribe old audio. Enrollment text follows the recording's deletion lifecycle and is shown only with recent profile authentication. Verification transcripts remain transient. Restart the Alink server after updating; the Python service does not need changes for this feature if its `/transcribe` endpoint is already running.

@@ -1,7 +1,7 @@
 // Software authenticator used only by this test client. No test bypass exists in the server.
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, randomBytes, createHash, sign } from 'node:crypto';
-const base='http://localhost:3000';let cookie='';
+const base=process.env.ALINK_TEST_ORIGIN||'http://localhost:3000';let cookie='';
 async function call(path,body,method='POST',extra={}){
  const response=await fetch(base+'/api'+path,{method,headers:{Origin:base,...(cookie?{Cookie:cookie}:{}),...(Buffer.isBuffer(body)?{'Content-Type':'audio/wav'}:body?{'Content-Type':'application/json'}:{}),...extra},body:Buffer.isBuffer(body)?body:body?JSON.stringify(body):undefined});
  if(response.headers.get('set-cookie'))cookie=response.headers.get('set-cookie').split(';')[0];return {status:response.status,data:await response.json()};
@@ -32,12 +32,30 @@ await approve('profile');
 // Generated tone tests storage/decoder transport only, not identity or speaker accuracy.
 const wav=Buffer.alloc(44+3*32000);wav.write('RIFF');wav.writeUInt32LE(wav.length-8,4);wav.write('WAVE',8);wav.write('fmt ',12);wav.writeUInt32LE(16,16);wav.writeUInt16LE(1,20);wav.writeUInt16LE(1,22);wav.writeUInt32LE(16000,24);wav.writeUInt32LE(32000,28);wav.writeUInt16LE(2,32);wav.writeUInt16LE(16,34);wav.write('data',36);wav.writeUInt32LE(wav.length-44,40);for(let i=44;i<wav.length;i+=2)wav.writeInt16LE(Math.round(Math.sin(i*.1)*6000),i);
 result=await call('/voices?variation=natural',wav,'POST',{'X-Recording-Consent':'yes'});assert.equal(result.status,200,JSON.stringify(result.data));const recording=result.data.profile.voices[0].id;
+if(process.env.ALINK_TEST_BANK==='1'){
+ assert.equal(result.data.profile.voices[0].transcript,'the rain in spain falls mainly on the plain');
+ const persisted=await call('/state',undefined,'GET');assert.equal(persisted.data.profile.voices[0].transcript,result.data.profile.voices[0].transcript);
+ const checked=await call('/voices/verify',wav,'POST',{'X-Recording-Consent':'yes'});assert.equal(checked.data.status,'consistent');assert.equal(checked.data.baselineSampleId,recording);assert.equal(checked.data.phrase.expected,persisted.data.profile.voices[0].transcript);
+}
 const audio=await fetch(base+`/api/voices/${recording}/audio`,{headers:{Cookie:cookie}});assert.equal(audio.status,200);assert.deepEqual(Buffer.from(await audio.arrayBuffer()),wav);
+if(process.env.ALINK_TEST_BANK==='1'){
+  result=await call('/bank/actions',{amountCents:100});assert.equal(result.status,200);const bank=result.data.id;
+  result=await call('/auth/options',{purpose:'refund',actionId:bank});assert.equal(result.status,400);assert.match(result.data.error,/speaker and full-phrase/);
+  const shortened=Buffer.from(wav);shortened.writeInt16LE(32000,44);
+  result=await call(`/bank/actions/${bank}/verify`,shortened,'POST',{'X-Recording-Consent':'yes'});assert.equal(result.status,200);assert.equal(result.data.speakerStatus,'consistent');assert.equal(result.data.phrase.status,'mismatch');assert.equal(result.data.status,'uncertain');
+  result=await call('/auth/options',{purpose:'refund',actionId:bank});assert.equal(result.status,400);
+  result=await call(`/bank/actions/${bank}/verify`,wav,'POST',{'X-Recording-Consent':'yes'});assert.equal(result.status,200);assert.equal(result.data.status,'consistent');
+  const other=await fetch(base+`/api/bank/actions/${bank}/verify`,{method:'POST',headers:{Origin:base,'Content-Type':'audio/wav','X-Recording-Consent':'yes'},body:wav});assert.equal(other.status,400);
+  const bankApproval=await approve('refund',bank);
+  result=await call(`/actions/${bank}/execute`,{approvalId:bankApproval.approvalId});assert.equal(result.status,200);assert.equal(result.data.actions.find(a=>a.id===bank).status,'executed');
+  result=await call(`/actions/${bank}/execute`,{approvalId:bankApproval.approvalId});assert.equal(result.status,400);
+  console.log('Bank API checks passed with a test-only speaker/transcript provider: voice-only denial, shortened phrase denial, workspace isolation, passkey-approved execution and replay rejection.');
+}
 result=await call('/voices/'+recording,undefined,'DELETE');assert.equal(result.status,200);assert.equal(result.data.profile.voices.length,0);
 result=await call('/doctor/scan');assert.equal(result.status,200);const repair=await approve('repair');result=await call('/doctor/apply',{approvalId:repair.approvalId});assert.equal(result.status,200);assert.equal(result.data.policy.originalMethodOnly,true);
 result=await call('/actions',{orderId:'ORD-1042',amountCents:5000,destination:'external-account'});assert.equal(result.status,400);
 result=await call('/actions',{orderId:'ORD-1042',amountCents:5000,destination:'original-card-4242'});assert.equal(result.status,200);const actionId=result.data.id;
-const proof=await approve('refund',actionId);result=await call(`/actions/${actionId}/execute`,{approvalId:proof.approvalId});assert.equal(result.status,200);assert.equal(result.data.orders[0].refundedCents,5000);
+const proof=await approve('refund',actionId);result=await call(`/actions/${actionId}/execute`,{approvalId:proof.approvalId});assert.equal(result.status,200);assert.equal(result.data.orders[0].refundedCents,process.env.ALINK_TEST_BANK==='1'?5100:5000);
 result=await call(`/actions/${actionId}/execute`,{approvalId:proof.approvalId});assert.equal(result.status,400);
 const rollback=await approve('rollback');result=await call('/doctor/rollback',{approvalId:rollback.approvalId});assert.equal(result.status,200);assert.equal(result.data.policy.version,3);
 console.log('Software-authenticator integration passed: WebAuthn registration/signatures, owner-scoped WAV save/playback/delete, repair approval, refund approval/execution/reuse denial, and rollback. Not a physical authenticator or voice-accuracy test.');

@@ -7,8 +7,9 @@ import { z } from 'zod';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import type { RegistrationResponseJSON, AuthenticationResponseJSON } from '@simplewebauthn/server';
 import { Store } from './src/server/store.ts';
-import { checkRefund, executeRefund, makeApproval, digest, doctorReport, applyRepair, rollback, log, draftRefund } from './src/server/engine.ts';
-import { speakerStatus, encodeVoice, compareVoice, validateWav, transcribe, semgrepAvailable, scanConnector } from './src/server/providers.ts';
+import { checkRefund, executeRefund, makeApproval, digest, doctorReport, applyRepair, rollback, log, draftRefund, requireBankVoice, voiceProfileDigest } from './src/server/engine.ts';
+import { speakerStatus, encodeVoice, compareVoice, combineVoiceAndPhrase, verifyEnrollment, transcribeLocal, validateWav, transcribe, semgrepAvailable, scanConnector } from './src/server/providers.ts';
+import type { BankVoiceProof } from './src/server/engine.ts';
 import type { AppState, RefundAction } from './src/shared/types.ts';
 const port=Number(process.env.PORT || 3000), origin=process.env.APP_ORIGIN || `http://localhost:${port}`, rpID=new URL(origin).hostname;
 if(!['localhost','127.0.0.1'].includes(rpID))throw new Error('This prototype only supports a localhost origin. Production identity provisioning is not implemented.');
@@ -26,6 +27,8 @@ const attempts=new Map<string,{count:number;start:number}>();
 const authenticated=new Map<string,number>();
 interface Challenge { challenge:string;expires:number;purpose:string;digest?:string;version?:number }
 const challenges=new Map<string,Challenge>();
+const bankProofs=new Map<string,BankVoiceProof>();
+const bankKey=(owner:string,id:string)=>owner+':'+id;
 const repairProofs=new Map<string,{token:string;expires:number;purpose:string;version:number}>();
 app.use('/api',(req,res,next)=>{
   let token=req.headers.cookie?.split(';').map(s=>s.trim()).find(s=>s.startsWith('alink_session='))?.slice(14);
@@ -41,7 +44,7 @@ function requireVerified(req:express.Request){if((authenticated.get(owner(req))?
 async function state(key:string):Promise<AppState> {
   const ws=await store.get(key), [speaker,semgrep]=await Promise.all([speakerStatus(),semgrepAvailable()]);
   const {approvals:_approvals,profile,...rest}=ws;
-  return {...rest,profile:{name:profile.name,hasPasskey:!!profile.credential,voices:profile.voices.map(({embedding:_embedding,...v})=>v)},
+  return {...rest,profile:{name:profile.name,hasPasskey:!!profile.credential,voices:profile.voices.map(({embedding:_embedding,transcript,...v})=>({...v,transcript:(authenticated.get(key)??0)>Date.now()?transcript:undefined}))},
     authenticated:(authenticated.get(key)??0)>Date.now(),integrations:{mongodb:{mode:store.mode,connected:true},elevenlabs:{configured:!!process.env.ELEVENLABS_API_KEY},speaker,semgrep:{available:semgrep}}};
 }
 app.get('/api/state',async(req,res)=>{res.json(await state(owner(req)));});
@@ -66,6 +69,7 @@ app.post('/api/auth/options',async(req,res)=>{
   let bound:Challenge={challenge:'',expires:Date.now()+120000,purpose:body.purpose,version:ws.policy.version};
   if(body.purpose==='refund'){
     const action=ws.actions.find(a=>a.id===body.actionId);if(!action)throw new Error('Action not found.');
+    requireBankVoice(ws,action,bankProofs.get(bankKey(key,action.id)));
     const denied=checkRefund(ws,action);if(denied)throw new Error(denied);
     bound={...bound,purpose:'refund:'+action.id,digest:digest(action)};
   }
@@ -86,6 +90,7 @@ app.post('/api/auth/verify',async(req,res)=>{
     current.profile.credential.counter=result.authenticationInfo.newCounter;
     if(challenge.purpose.startsWith('refund:')){
       const action=current.actions.find(a=>a.id===challenge.purpose.slice(7));if(!action||digest(action)!==challenge.digest||current.policy.version!==challenge.version)throw new Error('Transaction details changed during approval.');
+      requireBankVoice(current,action,bankProofs.get(bankKey(key,action.id)));
       const denied=checkRefund(current,action);if(denied)throw new Error(denied);
       const approval=makeApproval(action);proofId=approval.id;current.approvals.push(approval);current.approvals=current.approvals.slice(-100);
       log(current,'Exact action approved',`${action.id} · $${(action.amountCents/100).toFixed(2)} · ${action.destination}`);
@@ -103,8 +108,11 @@ app.post('/api/voices',raw,async(req,res)=>{
   requireVerified(req);if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
   const variation=z.enum(['natural','higher','lower','singing']).parse(req.query.variation),key=owner(req),bytes=audio(req);
   const existing=await store.get(key);if(existing.profile.voices.length>=8)throw new Error('Maximum eight enrollment samples. Delete one first.');
-  const embedding=await encodeVoice(bytes),id=randomUUID();await store.saveAudio(key,id,bytes);
-  try{await store.update(key,ws=>{if(ws.profile.voices.length>=8)throw new Error('Enrollment limit reached.');ws.profile.voices.push({id,variation,createdAt:new Date().toISOString(),bytes:bytes.length,embedding:embedding?.embedding??null,model:embedding?.model??null});log(ws,'Voice enrolled',`${variation} sample saved; ${embedding?'speaker embedding generated':'speaker model unavailable'}.`);});}
+  const [embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
+  if(!embedding)throw new Error('Enrollment not saved: speaker embedding unavailable. Start the local voice service and retry.');
+  if(!transcript?.trim())throw new Error('Enrollment not saved: no baseline text recognized. Check local transcription and record the full phrase clearly.');
+  const id=randomUUID();await store.saveAudio(key,id,bytes);
+  try{await store.update(key,ws=>{if(ws.profile.voices.length>=8)throw new Error('Enrollment limit reached.');ws.profile.voices.push({id,variation,createdAt:new Date().toISOString(),bytes:bytes.length,transcript,embedding:embedding.embedding,model:embedding.model});log(ws,'Voice enrolled',`${variation} sample saved; ${embedding?'speaker embedding generated':'speaker model unavailable'}.`);});}
   catch(error){await store.removeAudio(key,id);throw error;}
   res.json(await state(key));
 });
@@ -112,7 +120,9 @@ app.get('/api/voices/:id/audio',async(req,res)=>{requireVerified(req);const key=
 app.delete('/api/voices/:id',async(req,res)=>{requireVerified(req);const key=owner(req),id=z.string().uuid().parse(req.params.id);await store.update(key,ws=>{ws.profile.voices=ws.profile.voices.filter(v=>v.id!==id);log(ws,'Voice sample deleted','Recording and derived embedding removed.');});await store.removeAudio(key,id);res.json(await state(key));});
 app.post('/api/voices/verify',raw,async(req,res)=>{
   if(req.headers['x-recording-consent']!=='yes')throw new Error('Consent to process this recording required.');
-  const key=owner(req),bytes=audio(req),ws=await store.get(key),result=compareVoice(await encodeVoice(bytes),ws.profile.voices);
+  const key=owner(req),bytes=audio(req),ws=await store.get(key);
+  const [embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
+  const result=verifyEnrollment(embedding,transcript,ws.profile.voices);
   await store.update(key,w=>log(w,'Voice consistency checked',`${result.status}; verification audio was not retained. Voice alone grants no approval.`));res.json(result);
 });
 app.post('/api/transcribe',raw,async(req,res)=>{
@@ -130,9 +140,46 @@ app.post('/api/actions',async(req,res)=>{
 });
 app.post('/api/actions/:id/execute',async(req,res)=>{
   const key=owner(req),id=z.string().uuid().parse(req.params.id),approvalId=z.string().uuid().parse(req.body.approvalId);
-  try{await store.update(key,ws=>executeRefund(ws,id,approvalId));}
+  try{await store.update(key,ws=>executeRefund(ws,id,approvalId,Date.now(),bankProofs.get(bankKey(key,id))));}
   catch(error){await store.update(key,ws=>log(ws,'Execution blocked',error instanceof Error?error.message:'Request denied.'));throw error;}
+  bankProofs.delete(bankKey(key,id));
   res.json(await state(key));
+});
+app.get('/api/bank/config',(_req,res)=>res.json({configured:!!process.env.ELEVENLABS_API_KEY&&!!process.env.ELEVENLABS_AGENT_ID}));
+app.post('/api/bank/agent/session',async(req,res)=>{
+  requireVerified(req);
+  if(req.body.consent!==true)throw new Error('Consent to the ElevenLabs voice conversation is required.');
+  if(!process.env.ELEVENLABS_API_KEY||!process.env.ELEVENLABS_AGENT_ID)throw new Error('Set ELEVENLABS_API_KEY and ELEVENLABS_AGENT_ID, then restart Alink.');
+  const response=await fetch('https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id='+encodeURIComponent(process.env.ELEVENLABS_AGENT_ID),{headers:{'xi-api-key':process.env.ELEVENLABS_API_KEY},signal:AbortSignal.timeout(15000)});
+  if(!response.ok)throw new Error('Could not connect to the configured ElevenLabs agent. Check its ID, authentication settings and API key.');
+  const body=z.object({signed_url:z.string().url()}).parse(await response.json());
+  const ws=await store.get(owner(req));res.setHeader('Cache-Control','no-store');res.json({signedUrl:body.signed_url,clientName:ws.profile.name});
+});
+app.post('/api/bank/actions',async(req,res)=>{
+  const key=owner(req),amountCents=z.number().int().positive().max(12500).parse(req.body.amountCents);let id='';
+  await store.update(key,ws=>{
+    if(ws.actions.filter(a=>a.status==='pending'&&Date.parse(a.expiresAt)>Date.now()).length>=20)throw new Error('Too many pending requests.');
+    const order=ws.orders[0];if(!order)throw new Error('No eligible demo order.');
+    const action:RefundAction={id:randomUUID(),orderId:order.id,amountCents,destination:order.paymentMethod,currency:'USD',requiresVoice:true,status:'pending',createdAt:new Date().toISOString(),expiresAt:new Date(Date.now()+300000).toISOString(),policyVersion:ws.policy.version};
+    const denied=checkRefund(ws,action);if(denied)throw new Error(denied);ws.actions.unshift(action);ws.actions=ws.actions.slice(0,100);id=action.id;
+    log(ws,'Bank demo transaction requested','Original-method mock refund; speaker, phrase and exact-action passkey required.');
+  });res.json({id,state:await state(key)});
+});
+app.post('/api/bank/actions/:id/verify',raw,async(req,res)=>{
+  if(req.headers['x-recording-consent']!=='yes')throw new Error('Consent required.');
+  const key=owner(req),id=z.string().uuid().parse(req.params.id),ws=await store.get(key),action=ws.actions.find(a=>a.id===id);
+  bankProofs.delete(bankKey(key,id));
+  if(!action?.requiresVoice)throw new Error('Bank transaction not found.');
+  const denied=checkRefund(ws,action);if(denied)throw new Error(denied);
+  const bytes=audio(req),[embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
+  const result=verifyEnrollment(embedding,transcript,ws.profile.voices);
+  await store.update(key,current=>{
+    const latest=current.actions.find(a=>a.id===id);
+    if(!latest||digest(latest)!==digest(action)||voiceProfileDigest(current)!==voiceProfileDigest(ws)||checkRefund(current,latest))throw new Error('Transaction or enrollment changed; retry.');
+    log(current,'Bank voice verification',result.status+'; no recording or transcript retained.');
+  });
+  if(result.status==='consistent'&&result.phrase?.status==='matched')bankProofs.set(bankKey(key,id),{digest:digest(action),profileDigest:voiceProfileDigest(ws),expires:Math.min(Date.now()+120000,Date.parse(action.expiresAt))});
+  res.json(result);
 });
 app.post('/api/doctor/scan',async(req,res)=>{const key=owner(req),code=await scanConnector();await store.update(key,ws=>{ws.doctor=doctorReport(ws,code);log(ws,'Permission scan completed','Five scripted policy scenarios replayed. Code findings are actual Semgrep output when available.');});res.json(await state(key));});
 function consumeRepairProof(req:express.Request,purpose:string,version:number){const key=owner(req),proof=repairProofs.get(key);repairProofs.delete(key);if(!proof||proof.token!==req.body.approvalId||proof.expires<Date.now()||proof.purpose!==purpose||proof.version!==version)throw new Error('Fresh passkey approval for this policy change required.');}
@@ -147,6 +194,6 @@ app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.N
   res.status(400).json({error:message});
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Alink: ${origin} · storage=${store.mode} · local prototype, simulated refunds`));
-const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of repairProofs)if(v.expires<now)repairProofs.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
+const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of bankProofs)if(v.expires<now)bankProofs.delete(key);for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of repairProofs)if(v.expires<now)repairProofs.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
 async function stop(){clearInterval(cleanup);await vite?.close();server.close(async()=>{await store.close();process.exit(0);});}
 process.on('SIGINT',()=>void stop());process.on('SIGTERM',()=>void stop());

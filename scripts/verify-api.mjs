@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-const base='http://localhost:3000',origin=base;
+const base=process.env.ALINK_TEST_ORIGIN||'http://localhost:3000',origin=base;
 let cookie='';
 async function call(path,{method='POST',body}={}){
   const res=await fetch(base+'/api'+path,{method,headers:{Origin:origin,...(cookie?{Cookie:cookie}:{}),...(body?{'Content-Type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});
