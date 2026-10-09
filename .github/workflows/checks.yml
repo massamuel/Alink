@@ -1,0 +1,30 @@
+name: Alink checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --global pnpm@12
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm test
+  connector-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install semgrep
+      - name: Verify custom rules detect fixture flaws
+        run: |
+          semgrep scan --config semgrep/rules.yml fixtures/vulnerable-connector.ts --json --metrics=off > /tmp/findings.json
+          python -c 'import json; assert len(json.load(open("/tmp/findings.json"))["results"]) == 2'
+      - name: Verify repaired connector
+        run: semgrep scan --config semgrep/rules.yml fixtures/repaired-connector.ts --error --metrics=off

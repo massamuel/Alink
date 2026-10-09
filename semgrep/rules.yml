@@ -1,0 +1,16 @@
+rules:
+  - id: alink-direct-refund-execution
+    languages: [typescript]
+    severity: ERROR
+    message: Sample connector bypasses Alink authorization by directly calling bank.refund. Route through executeApprovedRefund.
+    pattern: bank.refund(...)
+  - id: alink-voice-only-approval
+    languages: [typescript]
+    severity: ERROR
+    message: A voice match alone must not authorize a sensitive action. Require exact-action passkey approval.
+    pattern: |
+      if (voiceMatch) {
+        ...
+        bank.refund(...);
+        ...
+      }
