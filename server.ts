@@ -208,10 +208,6 @@ app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.N
   res.status(error instanceof ApiError?error.status:400).json({error:message});
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Alink: ${origin} · storage=${store.mode} · local prototype, simulated refunds`));
-<<<<<<< HEAD
-const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of fileRequests)if(v.expires<now)fileRequests.delete(key);for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
-=======
-const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);for(const [key,v]of pendingAgent)if(v.expires<now)pendingAgent.delete(key);},60000);cleanup.unref();
->>>>>>> origin/main
+const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of pendingAgent)if(v.expires<now)pendingAgent.delete(key);for(const [key,v]of fileRequests)if(v.expires<now)fileRequests.delete(key);for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
 async function stop(){clearInterval(cleanup);await vite?.close();server.close(async()=>{await store.close();process.exit(0);});}
 process.on('SIGINT',()=>void stop());process.on('SIGTERM',()=>void stop());
