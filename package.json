@@ -16,7 +16,6 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "@elevenlabs/react": "^1.17.0",
     "@simplewebauthn/browser": "^13.2.2",
     "@simplewebauthn/server": "^13.2.2",
     "dotenv": "^17.2.0",

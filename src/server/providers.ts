@@ -1,9 +1,5 @@
-import { existsSync } from 'node:fs';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { z } from 'zod';
-import type { VoiceSample, VoiceResult, DoctorReport } from '../shared/types.ts';
-const exec = promisify(execFile);
+import type { VoiceSample, VoiceResult } from '../shared/types.ts';
 const embeddingSchema = z.object({ embedding:z.array(z.number().finite()).min(16).max(4096), model:z.string().min(1) });
 const voiceURL = () => process.env.VOICE_SERVICE_URL || 'http://127.0.0.1:8001';
 export async function speakerStatus() {
@@ -60,18 +56,6 @@ export async function transcribe(audio:Buffer) {
   if(!res.ok)throw new Error(`ElevenLabs transcription failed (${res.status}). Check your key and account.`);
   return z.object({text:z.string()}).parse(await res.json()).text;
 }
-const scanner = () => process.env.SEMGREP_BIN || (existsSync('.venv/bin/semgrep') ? '.venv/bin/semgrep' : 'semgrep');
-let scanStatus: {checked:number;available:boolean} | null = null;
-export async function semgrepAvailable(){if(scanStatus&&Date.now()-scanStatus.checked<30000)return scanStatus.available;let available=false;try{await exec(scanner(),['--version'],{timeout:8000});available=true;}catch{}scanStatus={checked:Date.now(),available};return available;}
-export async function scanConnector():Promise<DoctorReport['codeScan']> {
-  try {
-    const {stdout}=await exec(scanner(),['scan','--config','semgrep/rules.yml','fixtures','--json','--metrics=off','--disable-version-check'],{timeout:30000,maxBuffer:1024*1024});
-    const report=JSON.parse(stdout) as {results:{check_id:string;path:string;start:{line:number};extra:{message:string}}[];errors:unknown[]};
-    if(report.errors?.length)throw new Error('Scanner reported errors.');
-    return {status:'complete',findings:report.results.map(r=>({rule:r.check_id,path:r.path,line:r.start.line,message:r.extra.message})),message:'Actual Semgrep scan of deliberately vulnerable and repaired fixture connectors.'};
-  }catch{return {status:'unavailable',findings:[],message:'Semgrep is unavailable or failed. Install it and run the scan again; no code findings are fabricated.'};}
-}
-
 export const EXPECTED_PHRASE = 'The rain in Spain falls mainly on the plain';
 function normalizedWords(text:string) { return text.toLowerCase().normalize('NFKC').replace(/[^a-z0-9\s]/g,' ').trim().split(/\s+/).filter(Boolean).join(' '); }
 export function checkPhrase(transcript:string|null,expected=EXPECTED_PHRASE):import('../shared/types.ts').PhraseCheck {
