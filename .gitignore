@@ -10,3 +10,4 @@ __pycache__/
 voice-service/models/
 *.log
 .DS_Store
+agent-files/

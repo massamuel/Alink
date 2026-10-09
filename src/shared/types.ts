@@ -10,5 +10,7 @@ export interface AuditEvent { id: string; time: string; event: string; detail: s
 export interface Credential { id: string; publicKey: string; counter: number }
 export interface Profile { userId?: string; name: string; credential: Credential | null; voices: VoiceSample[] }
 export interface Workspace { revision: number; profile: Profile; orders: Order[]; policy: Policy; actions: RefundAction[]; approvals: Approval[]; audit: AuditEvent[]; }
-export interface IntegrationStatus { mongodb: { mode: 'mongodb' | 'local'; connected: boolean }; elevenlabs: { configured: boolean }; speaker: { ready: boolean; model: string | null };  }
+export interface IntegrationStatus { mongodb: { mode: 'mongodb' | 'local'; connected: boolean }; elevenlabs: { configured: boolean }; guild: { configured: boolean }; speaker: { ready: boolean; model: string | null };  }
 export interface AppState extends Omit<Workspace, 'profile' | 'approvals'> { profile: { userId?: string; name: string; hasPasskey: boolean; voices: Omit<VoiceSample,'embedding'>[] }; integrations: IntegrationStatus; authenticated: boolean }
+export interface AgentCommandResult { transcript: string; agentMessage: string; action: { type: 'create' | 'delete' | 'none'; filename: string | null }; needsVoice: boolean }
+export interface AgentApproveResult { voice: VoiceResult; approved: boolean; outcome: string; agentMessage: string }
