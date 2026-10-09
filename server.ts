@@ -125,6 +125,13 @@ app.post(['/api/voices/verify','/api/users/:user_id/embeddings/verify'],raw,asyn
   const result=verifyEnrollment(embedding,transcript,ws.profile.voices,variation);
   await store.update(key,w=>log(w,'Voice consistency checked',`${result.status}; verification audio was not retained. Voice alone grants no approval.`));res.json({...result,user_id:ws.profile.userId,name:ws.profile.name,verification:result.status==='consistent'?'Verification successful':result.status==='uncertain'?'Verification failure':'Verification unavailable'});
 });
+app.post('/api/agent/file-request',raw,async(req,res)=>{
+  if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
+  const text=await transcribeLocal(audio(req));
+  if(!text?.trim())throw new Error('Request transcription unavailable or no speech recognized. Start the local voice service and record your message again.');
+  await store.update(owner(req),ws=>log(ws,'Mock file request recorded','Request transcribed locally; waiting for voice verification. Audio was not retained.'));
+  res.json({text});
+});
 app.post('/api/transcribe',raw,async(req,res)=>{
   if(req.headers['x-elevenlabs-consent']!=='yes')throw new Error('Explicit consent to send this clip to ElevenLabs is required.');
   const text=await transcribe(audio(req));await store.update(owner(req),ws=>log(ws,'ElevenLabs transcription','User explicitly sent a request clip; transcript returned for review.'));res.json({text});
