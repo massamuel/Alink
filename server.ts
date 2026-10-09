@@ -6,6 +6,7 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import type { RegistrationResponseJSON, AuthenticationResponseJSON } from '@simplewebauthn/server';
+import { ApiError, pitchVariation, requireUser, checkEmbeddingSlot } from './src/server/users.ts';
 import { Store } from './src/server/store.ts';
 import { checkRefund, executeRefund, makeApproval, digest, log, draftRefund } from './src/server/engine.ts';
 import { speakerStatus, encodeVoice, verifyEnrollment, transcribeLocal, validateWav, transcribe } from './src/server/providers.ts';
@@ -40,10 +41,16 @@ function requireVerified(req:express.Request){if((authenticated.get(owner(req))?
 async function state(key:string):Promise<AppState> {
   const ws=await store.get(key),speaker=await speakerStatus();
   const {profile}=ws;
-  return {revision:ws.revision,orders:ws.orders,policy:ws.policy,actions:ws.actions.filter(a=>!a.requiresVoice),audit:ws.audit,profile:{name:profile.name,hasPasskey:!!profile.credential,voices:profile.voices.map(({embedding:_embedding,transcript,...v})=>({...v,transcript:(authenticated.get(key)??0)>Date.now()?transcript:undefined}))},
+  return {revision:ws.revision,orders:ws.orders,policy:ws.policy,actions:ws.actions.filter(a=>!a.requiresVoice),audit:ws.audit,profile:{userId:profile.userId,name:profile.name,hasPasskey:!!profile.credential,voices:profile.voices.map(({embedding:_embedding,transcript,...v})=>({...v,transcript:(authenticated.get(key)??0)>Date.now()?transcript:undefined}))},
     authenticated:(authenticated.get(key)??0)>Date.now(),integrations:{mongodb:{mode:store.mode,connected:true},elevenlabs:{configured:!!process.env.ELEVENLABS_API_KEY},speaker}};
 }
-app.get('/api/state',async(req,res)=>{res.json(await state(owner(req)));});
+app.post('/api/users',async(req,res)=>{
+  z.object({name:z.literal('Jordan Example').optional()}).parse(req.body??{});
+  const key=owner(req);let created=false;
+  const user=await store.update(key,ws=>{created=!ws.profile.userId;if(created){ws.profile.userId=randomUUID();log(ws,'Demo user registered','Persistent user identity assigned to the existing profile.');}return {user_id:ws.profile.userId!,name:ws.profile.name};});
+  res.status(created?201:200).json(user);
+});
+app.get('/api/state' ,async(req,res)=>{res.json(await state(owner(req)));});
 app.post('/api/auth/register/options',async(req,res)=>{
   const key=owner(req),ws=await store.get(key);if(ws.profile.credential)throw new Error('A passkey already exists. Use Verify passkey.');
   const options=await generateRegistrationOptions({rpName:'Alink local demo',rpID,userID:new Uint8Array(Buffer.from(key,'hex')),userName:ws.profile.name,attestationType:'none',authenticatorSelection:{residentKey:'preferred',userVerification:'required'}});
@@ -95,26 +102,28 @@ app.post('/api/auth/verify',async(req,res)=>{
 });
 const raw=express.raw({type:'audio/wav',limit:'2mb'});
 function audio(req:express.Request){if(!Buffer.isBuffer(req.body))throw new Error('Send audio/wav bytes.');validateWav(req.body);return req.body as Buffer;}
-app.post('/api/voices',raw,async(req,res)=>{
+app.post(['/api/voices','/api/users/:user_id/embeddings'],raw,async(req,res)=>{
   requireVerified(req);if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
-  const variation=z.enum(['natural','higher','lower','singing']).parse(req.query.variation),key=owner(req),bytes=audio(req);
-  const existing=await store.get(key);if(existing.profile.voices.length>=8)throw new Error('Maximum eight enrollment samples. Delete one first.');
+  const variation=pitchVariation(req.query.pitch??req.query.variation??'normal'),key=owner(req),bytes=audio(req);
+  const existing=await store.get(key);if(req.params.user_id)requireUser(existing.profile,req.params.user_id);checkEmbeddingSlot(existing.profile,variation);
   const [embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
   if(!embedding)throw new Error('Enrollment not saved: speaker embedding unavailable. Start the local voice service and retry.');
   if(!transcript?.trim())throw new Error('Enrollment not saved: no baseline text recognized. Check local transcription and record the full phrase clearly.');
   const id=randomUUID();await store.saveAudio(key,id,bytes);
-  try{await store.update(key,ws=>{if(ws.profile.voices.length>=8)throw new Error('Enrollment limit reached.');ws.profile.voices.push({id,variation,createdAt:new Date().toISOString(),bytes:bytes.length,transcript,embedding:embedding.embedding,model:embedding.model});log(ws,'Voice enrolled',`${variation} sample saved; ${embedding?'speaker embedding generated':'speaker model unavailable'}.`);});}
+  try{await store.update(key,ws=>{if(req.params.user_id)requireUser(ws.profile,req.params.user_id);checkEmbeddingSlot(ws.profile,variation);ws.profile.voices.push({id,variation,createdAt:new Date().toISOString(),bytes:bytes.length,transcript,embedding:embedding.embedding,model:embedding.model});log(ws,'Voice enrolled',`${variation} sample saved; ${embedding?'speaker embedding generated':'speaker model unavailable'}.`);});}
   catch(error){await store.removeAudio(key,id);throw error;}
   res.json(await state(key));
 });
 app.get('/api/voices/:id/audio',async(req,res)=>{requireVerified(req);const key=owner(req),id=z.string().uuid().parse(req.params.id);const ws=await store.get(key);if(!ws.profile.voices.some(v=>v.id===id)){res.status(404).json({error:'Recording not found.'});return;}const bytes=await store.audio(key,id);if(!bytes){res.sendStatus(404);return;}res.type('audio/wav').send(bytes);});
 app.delete('/api/voices/:id',async(req,res)=>{requireVerified(req);const key=owner(req),id=z.string().uuid().parse(req.params.id);await store.update(key,ws=>{ws.profile.voices=ws.profile.voices.filter(v=>v.id!==id);log(ws,'Voice sample deleted','Recording and derived embedding removed.');});await store.removeAudio(key,id);res.json(await state(key));});
-app.post('/api/voices/verify',raw,async(req,res)=>{
+app.post(['/api/voices/verify','/api/users/:user_id/embeddings/verify'],raw,async(req,res)=>{
   if(req.headers['x-recording-consent']!=='yes')throw new Error('Consent to process this recording required.');
   const key=owner(req),bytes=audio(req),ws=await store.get(key);
+  if(req.params.user_id)requireUser(ws.profile,req.params.user_id);
+  const variation=pitchVariation(req.query.pitch??req.query.variation??'normal');
   const [embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
-  const result=verifyEnrollment(embedding,transcript,ws.profile.voices);
-  await store.update(key,w=>log(w,'Voice consistency checked',`${result.status}; verification audio was not retained. Voice alone grants no approval.`));res.json(result);
+  const result=verifyEnrollment(embedding,transcript,ws.profile.voices,variation);
+  await store.update(key,w=>log(w,'Voice consistency checked',`${result.status}; verification audio was not retained. Voice alone grants no approval.`));res.json({...result,user_id:ws.profile.userId,name:ws.profile.name,verification:result.status==='consistent'?'Verification successful':result.status==='uncertain'?'Verification failure':'Verification unavailable'});
 });
 app.post('/api/transcribe',raw,async(req,res)=>{
   if(req.headers['x-elevenlabs-consent']!=='yes')throw new Error('Explicit consent to send this clip to ElevenLabs is required.');
@@ -141,7 +150,7 @@ const vite=process.argv.includes('--dev')?await(await import('vite')).createServ
 if(vite)app.use(vite.middlewares);else app.use(express.static(resolve('dist'),{dotfiles:'deny'}));
 app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.NextFunction)=>{
   const message=error instanceof z.ZodError?'Invalid request data.':error instanceof Error?error.message:'Request failed.';
-  res.status(400).json({error:message});
+  res.status(error instanceof ApiError?error.status:400).json({error:message});
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Alink: ${origin} · storage=${store.mode} · local prototype, simulated refunds`));
 const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();

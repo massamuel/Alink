@@ -8,7 +8,7 @@ export interface PhraseCheck { status: 'matched' | 'mismatch' | 'unavailable'; e
 export interface VoiceResult { baselineSampleId?: string; phrase?: PhraseCheck; speakerStatus?: 'consistent' | 'uncertain' | 'unavailable'; status: 'consistent' | 'uncertain' | 'unavailable'; score: number | null; scores: { variation: Variation; score: number }[]; threshold: number; message: string; model: string | null }
 export interface AuditEvent { id: string; time: string; event: string; detail: string }
 export interface Credential { id: string; publicKey: string; counter: number }
-export interface Profile { name: string; credential: Credential | null; voices: VoiceSample[] }
+export interface Profile { userId?: string; name: string; credential: Credential | null; voices: VoiceSample[] }
 export interface Workspace { revision: number; profile: Profile; orders: Order[]; policy: Policy; actions: RefundAction[]; approvals: Approval[]; audit: AuditEvent[]; }
 export interface IntegrationStatus { mongodb: { mode: 'mongodb' | 'local'; connected: boolean }; elevenlabs: { configured: boolean }; speaker: { ready: boolean; model: string | null };  }
-export interface AppState extends Omit<Workspace, 'profile' | 'approvals'> { profile: { name: string; hasPasskey: boolean; voices: Omit<VoiceSample,'embedding'>[] }; integrations: IntegrationStatus; authenticated: boolean }
+export interface AppState extends Omit<Workspace, 'profile' | 'approvals'> { profile: { userId?: string; name: string; hasPasskey: boolean; voices: Omit<VoiceSample,'embedding'>[] }; integrations: IntegrationStatus; authenticated: boolean }

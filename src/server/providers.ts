@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { VoiceSample, VoiceResult } from '../shared/types.ts';
+import type { VoiceSample, VoiceResult, Variation } from '../shared/types.ts';
 const embeddingSchema = z.object({ embedding:z.array(z.number().finite()).min(16).max(4096), model:z.string().min(1) });
 const voiceURL = () => process.env.VOICE_SERVICE_URL || 'http://127.0.0.1:8001';
 export async function speakerStatus() {
@@ -17,19 +17,19 @@ export function cosine(a:number[],b:number[]):number {
   let dot=0,x=0,y=0; for(let i=0;i<a.length;i++){dot+=a[i]*b[i];x+=a[i]**2;y+=b[i]**2;}
   if(!x||!y)throw new Error('Invalid zero-vector embedding.');return Math.max(-1,Math.min(1,dot/Math.sqrt(x*y)));
 }
-export function compareVoice(candidate:{embedding:number[];model:string}|null,samples:VoiceSample[]):VoiceResult {
+export function compareVoice(candidate:{embedding:number[];model:string}|null,samples:VoiceSample[],referenceVariation:Variation='natural'):VoiceResult {
   const threshold=Number(process.env.VOICE_THRESHOLD || 0.65);
   const base={score:null,scores:[],threshold,model:candidate?.model??null};
   if(!candidate)return {...base,status:'unavailable',message:'Speaker model unavailable. Configure the local voice service; use passkey verification meanwhile.'};
   const compatible=samples.filter(s=>s.embedding&&s.model===candidate.model&&s.embedding.length===candidate.embedding.length);
-  // Conservative mean across natural samples. Other styles are diagnostic; an any-match rule is not used.
-  const natural=compatible.filter(s=>s.variation==='natural');
-  if(!natural.length)return {...base,status:'unavailable',message:'No compatible natural-voice enrollment. Authenticate and record a natural sample with the model running.'};
+  // Compare the explicitly selected pitch; other styles cannot override its score.
+  const natural=compatible.filter(s=>s.variation===referenceVariation);
+  if(!natural.length)return {...base,status:'unavailable',message:'No compatible enrollment for the selected pitch. Authenticate and record that pitch with the model running.'};
   const scores=compatible.map(s=>({variation:s.variation,score:cosine(candidate.embedding,s.embedding!)}));
-  const naturalScores=scores.filter(s=>s.variation==='natural');
+  const naturalScores=scores.filter(s=>s.variation===referenceVariation);
   const score=naturalScores.reduce((sum,s)=>sum+s.score,0)/naturalScores.length;
   return {status:score>=threshold?'consistent':'uncertain',score,scores,threshold,model:candidate.model,
-    message:score>=threshold?'Voice is consistent with the natural enrollment. This is not liveness or deepfake verification.':'Voice is uncertain. Illness or recording conditions may affect matching. Verify with your passkey; the threshold is unchanged.'};
+    message:score>=threshold?'Voice is consistent with the selected pitch enrollment. This is not liveness or deepfake verification.':'Voice is uncertain. Illness or recording conditions may affect matching. Verify with your passkey; the threshold is unchanged.'};
 }
 export function validateWav(bytes:Buffer):{duration:number;rms:number} {
   if(bytes.length<44||bytes.toString('ascii',0,4)!=='RIFF'||bytes.toString('ascii',8,12)!=='WAVE')throw new Error('Upload a PCM WAV recording.');
@@ -78,15 +78,15 @@ export async function transcribeLocal(audio:Buffer):Promise<string|null> {
 
 // Select one baseline phrase, then compare only recordings carrying that same text.
 // Do not combine text from one sample with speaker evidence from another phrase.
-export function verifyEnrollment(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[]):VoiceResult {
-  const baseline=samples.find(s=>s.variation==='natural'&&s.embedding&&s.model===candidate?.model&&s.embedding.length===candidate?.embedding.length&&s.transcript&&normalizedWords(s.transcript));
-  if(!candidate)return combineVoiceAndPhrase(compareVoice(candidate,samples),transcript);
+export function verifyEnrollment(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[],referenceVariation:Variation='natural'):VoiceResult {
+  const baseline=samples.find(s=>s.variation===referenceVariation&&s.embedding&&s.model===candidate?.model&&s.embedding.length===candidate?.embedding.length&&s.transcript&&normalizedWords(s.transcript));
+  if(!candidate)return combineVoiceAndPhrase(compareVoice(candidate,samples,referenceVariation),transcript);
   if(!baseline){
-    const speaker=compareVoice(candidate,[]);
-    return {...speaker,speakerStatus:'unavailable',phrase:{status:'unavailable',expected:'',transcript,message:'No complete stored baseline.'},message:'No compatible natural baseline with both transcript and embedding. Verify your passkey and save a new natural sample.'};
+    const speaker=compareVoice(candidate,[],referenceVariation);
+    return {...speaker,speakerStatus:'unavailable',phrase:{status:'unavailable',expected:'',transcript,message:'No complete stored baseline.'},message:'No compatible baseline for the selected pitch with both transcript and embedding. Verify your passkey and enroll this pitch.'};
   }
   const references=samples.filter(s=>s.transcript&&normalizedWords(s.transcript)===normalizedWords(baseline.transcript!));
-  const speaker=compareVoice(candidate,references),phrase=checkPhrase(transcript,baseline.transcript!),speakerStatus=speaker.status;
+  const speaker=compareVoice(candidate,references,referenceVariation),phrase=checkPhrase(transcript,baseline.transcript!),speakerStatus=speaker.status;
   const status=speakerStatus==='unavailable'||phrase.status==='unavailable'?'unavailable':speakerStatus==='consistent'&&phrase.status==='matched'?'consistent':'uncertain';
   return {...speaker,baselineSampleId:baseline.id,speakerStatus,phrase,status,message:status==='consistent'?'Verification successful. Speaker and spoken text match the stored enrollment baseline.':status==='unavailable'?'Verification unavailable. '+(phrase.status==='unavailable'?phrase.message:speaker.message):'Verification failure. '+(phrase.status==='mismatch'?'The spoken words differ from the stored baseline.':speaker.message)};
 }
