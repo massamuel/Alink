@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { generateRegistrationOptions, verifyRegistrationResponse, generateAuthenticationOptions, verifyAuthenticationResponse } from '@simplewebauthn/server';
 import type { RegistrationResponseJSON, AuthenticationResponseJSON } from '@simplewebauthn/server';
 import { ApiError, pitchVariation, requireUser, checkEmbeddingSlot } from './src/server/users.ts';
+import { runFileAgent } from './src/server/guild.ts';
 import { Store } from './src/server/store.ts';
 import { checkRefund, executeRefund, makeApproval, digest, log, draftRefund } from './src/server/engine.ts';
 import { speakerStatus, encodeVoice, verifyEnrollment, transcribeLocal, validateWav, transcribe } from './src/server/providers.ts';
@@ -125,12 +126,29 @@ app.post(['/api/voices/verify','/api/users/:user_id/embeddings/verify'],raw,asyn
   const result=verifyEnrollment(embedding,transcript,ws.profile.voices,variation);
   await store.update(key,w=>log(w,'Voice consistency checked',`${result.status}; verification audio was not retained. Voice alone grants no approval.`));res.json({...result,user_id:ws.profile.userId,name:ws.profile.name,verification:result.status==='consistent'?'Verification successful':result.status==='uncertain'?'Verification failure':'Verification unavailable'});
 });
+const fileRequests=new Map<string,{id:string;text:string;expires:number}>();
 app.post('/api/agent/file-request',raw,async(req,res)=>{
   if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
   const text=await transcribeLocal(audio(req));
   if(!text?.trim())throw new Error('Request transcription unavailable or no speech recognized. Start the local voice service and record your message again.');
   await store.update(owner(req),ws=>log(ws,'Mock file request recorded','Request transcribed locally; waiting for voice verification. Audio was not retained.'));
-  res.json({text});
+  const requestId=randomUUID();fileRequests.set(owner(req),{id:requestId,text,expires:Date.now()+300000});
+  res.json({text,requestId});
+});
+app.post('/api/agent/file-request/:id/verify',raw,async(req,res)=>{
+  if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
+  const key=owner(req),pending=fileRequests.get(key),ws=await store.get(key);
+  if(!pending||pending.id!==req.params.id||pending.expires<Date.now())throw new Error('File request expired or missing. Record your request again.');
+  requireUser(ws.profile,req.query.user_id);
+  const variation=pitchVariation(req.query.variation??'normal'),bytes=audio(req);
+  fileRequests.delete(key);
+  const [embedding,transcript]=await Promise.all([encodeVoice(bytes),transcribeLocal(bytes)]);
+  const result=verifyEnrollment(embedding,transcript,ws.profile.voices,variation);
+  await store.update(key,w=>log(w,'Agent voice verification',`${result.status}; voice and phrase checked locally. Verification audio not retained.`));
+  if(result.status!=='consistent'){res.json({result});return;}
+  const agent=await runFileAgent(ws.profile.name,pending.text);
+  await store.update(key,w=>log(w,'Guild mock file completed',`Guild session ${agent.sessionId}; no filesystem write performed.`));
+  res.json({result,agent,file:{name:'agent-message.txt',text:pending.text}});
 });
 app.post('/api/transcribe',raw,async(req,res)=>{
   if(req.headers['x-elevenlabs-consent']!=='yes')throw new Error('Explicit consent to send this clip to ElevenLabs is required.');
@@ -160,6 +178,6 @@ app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.N
   res.status(error instanceof ApiError?error.status:400).json({error:message});
 });
 server.listen(port,'127.0.0.1',()=>console.log(`Alink: ${origin} · storage=${store.mode} · local prototype, simulated refunds`));
-const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
+const cleanup=setInterval(()=>{const now=Date.now();for(const [key,v]of fileRequests)if(v.expires<now)fileRequests.delete(key);for(const [key,v]of challenges)if(v.expires<now)challenges.delete(key);for(const [key,v]of authenticated)if(v<now)authenticated.delete(key);for(const [key,v]of attempts)if(now-v.start>60000)attempts.delete(key);},60000);cleanup.unref();
 async function stop(){clearInterval(cleanup);await vite?.close();server.close(async()=>{await store.close();process.exit(0);});}
 process.on('SIGINT',()=>void stop());process.on('SIGTERM',()=>void stop());
