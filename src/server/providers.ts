@@ -1,3 +1,4 @@
+import { backendLog, requestContext } from './logger.ts';
 import { z } from 'zod';
 import type { VoiceSample, VoiceResult, Variation } from '../shared/types.ts';
 const embeddingSchema = z.object({ embedding:z.array(z.number().finite()).min(16).max(4096), model:z.string().min(1) });
@@ -7,10 +8,11 @@ export async function speakerStatus() {
   catch{return {ready:false,model:null};}
 }
 export async function encodeVoice(audio:Buffer):Promise<{embedding:number[];model:string}|null> {
+  const started=performance.now();backendLog('voice.embedding_started',{bytes:audio.length});
   try {
-    const response=await fetch(voiceURL()+'/embed',{method:'POST',headers:{'Content-Type':'audio/wav'},body:new Uint8Array(audio),signal:AbortSignal.timeout(90000)});
-    if(!response.ok)return null; return embeddingSchema.parse(await response.json());
-  } catch{return null;}
+    const response=await fetch(voiceURL()+'/embed',{method:'POST',headers:{'Content-Type':'audio/wav','X-Request-ID':requestContext.getStore()?.requestId??''},body:new Uint8Array(audio),signal:AbortSignal.timeout(90000)});
+    if(!response.ok){backendLog('voice.embedding_failed',{status:response.status});return null;} const result=embeddingSchema.parse(await response.json());backendLog('voice.embedding_completed',{durationMs:Math.round(performance.now()-started)});return result;
+  } catch{backendLog('voice.embedding_failed',{reason:'transport_or_invalid_response'});return null;}
 }
 export function cosine(a:number[],b:number[]):number {
   if(a.length!==b.length || !a.length)throw new Error('Incompatible voice embeddings.');
@@ -69,16 +71,17 @@ export function combineVoiceAndPhrase(speaker:VoiceResult,transcript:string|null
   return {...speaker,speakerStatus,phrase,status,message:status==='consistent'?'Speaker and complete phrase are consistent. This is not liveness or deepfake verification.':speakerStatus==='unavailable'?speaker.message:phrase.status!=='matched'?phrase.message:speaker.message};
 }
 export async function transcribeLocal(audio:Buffer):Promise<string|null> {
+  const started=performance.now();backendLog('voice.transcription_started',{bytes:audio.length});
   try {
-    const res=await fetch(voiceURL()+'/transcribe',{method:'POST',headers:{'Content-Type':'audio/wav'},body:new Uint8Array(audio),signal:AbortSignal.timeout(90000)});
-    if(!res.ok)return null;
-    return z.object({text:z.string().max(10000)}).parse(await res.json()).text;
-  }catch{return null;}
+    const res=await fetch(voiceURL()+'/transcribe',{method:'POST',headers:{'Content-Type':'audio/wav','X-Request-ID':requestContext.getStore()?.requestId??''},body:new Uint8Array(audio),signal:AbortSignal.timeout(90000)});
+    if(!res.ok){backendLog('voice.transcription_failed',{status:res.status});return null;}
+    const text=z.object({text:z.string().max(10000)}).parse(await res.json()).text;backendLog('voice.transcription_completed',{durationMs:Math.round(performance.now()-started)});return text;
+  }catch{backendLog('voice.transcription_failed',{reason:'transport_or_invalid_response'});return null;}
 }
 
 // Select one baseline phrase, then compare only recordings carrying that same text.
 // Do not combine text from one sample with speaker evidence from another phrase.
-export function verifyEnrollment(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[],referenceVariation:Variation='natural'):VoiceResult {
+function verifyEnrollmentResult(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[],referenceVariation:Variation='natural'):VoiceResult {
   const baseline=samples.find(s=>s.variation===referenceVariation&&s.embedding&&s.model===candidate?.model&&s.embedding.length===candidate?.embedding.length&&s.transcript&&normalizedWords(s.transcript));
   if(!candidate)return combineVoiceAndPhrase(compareVoice(candidate,samples,referenceVariation),transcript);
   if(!baseline){
@@ -89,4 +92,10 @@ export function verifyEnrollment(candidate:{embedding:number[];model:string}|nul
   const speaker=compareVoice(candidate,references,referenceVariation),phrase=checkPhrase(transcript,baseline.transcript!),speakerStatus=speaker.status;
   const status=speakerStatus==='unavailable'||phrase.status==='unavailable'?'unavailable':speakerStatus==='consistent'&&phrase.status==='matched'?'consistent':'uncertain';
   return {...speaker,baselineSampleId:baseline.id,speakerStatus,phrase,status,message:status==='consistent'?'Verification successful. Speaker and spoken text match the stored enrollment baseline.':status==='unavailable'?'Verification unavailable. '+(phrase.status==='unavailable'?phrase.message:speaker.message):'Verification failure. '+(phrase.status==='mismatch'?'The spoken words differ from the stored baseline.':speaker.message)};
+}
+
+export function verifyEnrollment(candidate:{embedding:number[];model:string}|null,transcript:string|null,samples:VoiceSample[],referenceVariation:Variation='natural'):VoiceResult {
+  const result=verifyEnrollmentResult(candidate,transcript,samples,referenceVariation);
+  backendLog('voice.baseline_checked',{variation:referenceVariation,sampleCount:samples.length,baselineFound:!!result.baselineSampleId,speakerStatus:result.speakerStatus,phraseStatus:result.phrase?.status,status:result.status,score:result.score,threshold:result.threshold});
+  return result;
 }

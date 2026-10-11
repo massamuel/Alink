@@ -62,3 +62,13 @@ For isolated API tests, start `node scripts/mock-voice-service.mjs`, point a sep
 Semgrep remains an optional development/CI fixture scan (`pnpm scan`, or `.venv/bin/semgrep scan --config semgrep/rules.yml fixtures --json` after installing `requirements-tools.txt`). It has no app page or runtime API. The Permission Doctor and bank-agent pages, tools and routes have been removed.
 
 This application is a localhost hackathon prototype. There is no production identity provisioning, recovery, real banking connector or public hosting.
+
+### Backend diagnostic logs
+
+The Node server and Python voice service emit one JSON event per line to stdout/stderr. Capture these streams with your process manager. Each browser response includes `X-Request-ID`; search that ID in both services to trace processing. Node generates the ID and forwards it to the local voice service.
+
+Events cover HTTP status and duration, host/origin/rate-limit rejections, passkey challenge issuance and successful verification, passkey-protected enrollment access, validated audio quality, local embedding/transcription success or failure, baseline persistence, and baseline verification outcomes. `voice.baseline_checked` includes the selected pitch, enrollment count, whether a compatible baseline was found, speaker score/threshold, phrase status, and combined status. Provider failures report HTTP status or a fixed failure category. `request.failed` identifies the failing route and error category; the paired HTTP event reports status.
+
+Enrollment requires a verified profile passkey and recording consent. Voice verification selects a baseline with matching pitch/model/dimensions and checks the speaker and words against that baseline. A voice match is not liveness proof; refund execution still requires exact-action passkey approval.
+
+Diagnostic logs omit audio, embeddings, transcripts/baseline text, cookies, passkey material, request bodies, query strings, and raw exception messages. They contain voice similarity scores; configure access and retention in your log collector. Existing in-app audit history is separate from these diagnostics. Logs go to process streams; no log file or collector is configured automatically.

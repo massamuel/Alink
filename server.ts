@@ -1,3 +1,4 @@
+import { backendLog, requestContext } from './src/server/logger.ts';
 import 'dotenv/config';
 import express from 'express';
 import { createServer } from 'node:http';
@@ -20,9 +21,17 @@ if(!['localhost','127.0.0.1'].includes(rpID))throw new Error('This prototype onl
 const store=new Store();await store.init();
 const app=express();app.disable('x-powered-by');
 app.use((req,res,next)=>{
-  if(req.headers.host!==new URL(origin).host){res.status(400).json({error:`Open ${origin}; host is not allowed.`});return;}
+  const requestId=randomUUID(),started=performance.now();
+  res.setHeader('X-Request-ID',requestId);
+  requestContext.run({requestId},()=>{
+    res.on('finish',()=>requestContext.run({requestId},()=>backendLog('http.completed',{method:req.method,route:Array.isArray(req.route?.path)?req.route.path.join('|'):req.route?.path??'unmatched',status:res.statusCode,durationMs:Math.round(performance.now()-started)})));
+    next();
+  });
+});
+app.use((req,res,next)=>{
+  if(req.headers.host!==new URL(origin).host){backendLog('security.rejected',{reason:'host_not_allowed'});res.status(400).json({error:`Open ${origin}; host is not allowed.`});return;}
   res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Cache-Control','no-store');
-  if(req.path.startsWith('/api')&&req.method!=='GET'&&req.headers.origin!==origin){res.status(403).json({error:'A same-origin browser request is required.'});return;}
+  if(req.path.startsWith('/api')&&req.method!=='GET'&&req.headers.origin!==origin){backendLog('security.rejected',{reason:'origin_not_allowed'});res.status(403).json({error:'A same-origin browser request is required.'});return;}
   next();
 });
 app.use(express.json({limit:'256kb'}));
@@ -37,11 +46,11 @@ app.use('/api',(req,res,next)=>{
   const key=createHash('sha256').update(token).digest('hex');keys.set(req,key);
   const record=attempts.get(key),now=Date.now();
   if(!record||now-record.start>60000)attempts.set(key,{count:1,start:now});
-  else if(++record.count>120){res.status(429).json({error:'Too many requests. Wait a minute.'});return;}
+  else if(++record.count>120){backendLog('security.rejected',{reason:'rate_limit'});res.status(429).json({error:'Too many requests. Wait a minute.'});return;}
   next();
 });
 const owner=(req:express.Request)=>keys.get(req)!;
-function requireVerified(req:express.Request){if((authenticated.get(owner(req))??0)<Date.now())throw new Error('Verify your registered passkey before changing enrollment or viewing recordings.');}
+function requireVerified(req:express.Request){const verified=(authenticated.get(owner(req))??0)>=Date.now();backendLog('security.profile_access',{authenticated:verified});if(!verified)throw new Error('Verify your registered passkey before changing enrollment or viewing recordings.');}
 async function state(key:string):Promise<AppState> {
   const ws=await store.get(key),speaker=await speakerStatus();
   const {profile}=ws;
@@ -58,7 +67,7 @@ app.get('/api/state' ,async(req,res)=>{res.json(await state(owner(req)));});
 app.post('/api/auth/register/options',async(req,res)=>{
   const key=owner(req),ws=await store.get(key);if(ws.profile.credential)throw new Error('A passkey already exists. Use Verify passkey.');
   const options=await generateRegistrationOptions({rpName:'Alink local demo',rpID,userID:new Uint8Array(Buffer.from(key,'hex')),userName:ws.profile.name,attestationType:'none',authenticatorSelection:{residentKey:'preferred',userVerification:'required'}});
-  challenges.set(key,{challenge:options.challenge,expires:Date.now()+120000,purpose:'register'});res.json(options);
+  challenges.set(key,{challenge:options.challenge,expires:Date.now()+120000,purpose:'register'});backendLog('auth.challenge_issued',{purpose:'register'});res.json(options);
 });
 app.post('/api/auth/register/verify',async(req,res)=>{
   const key=owner(req),challenge=challenges.get(key);challenges.delete(key);
@@ -67,7 +76,7 @@ app.post('/api/auth/register/verify',async(req,res)=>{
   if(!result.verified||!result.registrationInfo)throw new Error('Passkey registration failed.');
   const credential=result.registrationInfo.credential;
   await store.update(key,ws=>{if(ws.profile.credential)throw new Error('A passkey already exists.');ws.profile.credential={id:credential.id,publicKey:Buffer.from(credential.publicKey).toString('base64url'),counter:credential.counter};log(ws,'Passkey registered','Local demo profile provisioned with authenticator user verification.');});
-  authenticated.set(key,Date.now()+300000);res.json({verified:true});
+  authenticated.set(key,Date.now()+300000);backendLog('auth.registration_verified',{authenticated:true});res.json({verified:true});
 });
 const authPurpose=z.object({purpose:z.enum(['profile','refund']),actionId:z.string().uuid().optional()});
 app.post('/api/auth/options',async(req,res)=>{
@@ -80,7 +89,7 @@ app.post('/api/auth/options',async(req,res)=>{
     bound={...bound,purpose:'refund:'+action.id,digest:digest(action)};
   }
   const options=await generateAuthenticationOptions({rpID,userVerification:'required',allowCredentials:[{id:credential.id}]});
-  bound.challenge=options.challenge;challenges.set(key,bound);res.json(options);
+  bound.challenge=options.challenge;challenges.set(key,bound);backendLog('auth.challenge_issued',{purpose:body.purpose});res.json(options);
 });
 app.post('/api/auth/verify',async(req,res)=>{
   const key=owner(req),challenge=challenges.get(key);challenges.delete(key);
@@ -102,10 +111,10 @@ app.post('/api/auth/verify',async(req,res)=>{
     }else log(current,'Passkey verified',`Verified purpose: ${challenge.purpose}`);
   });
   if(challenge.purpose==='profile')authenticated.set(key,Date.now()+300000);
-  res.json({verified:true,approvalId:proofId});
+  backendLog('auth.verified',{purpose:challenge.purpose.startsWith('refund:')?'refund':'profile',authenticated:challenge.purpose==='profile'});res.json({verified:true,approvalId:proofId});
 });
 const raw=express.raw({type:'audio/wav',limit:'2mb'});
-function audio(req:express.Request){if(!Buffer.isBuffer(req.body))throw new Error('Send audio/wav bytes.');validateWav(req.body);return req.body as Buffer;}
+function audio(req:express.Request){if(!Buffer.isBuffer(req.body))throw new Error('Send audio/wav bytes.');const quality=validateWav(req.body);backendLog('voice.audio_validated',{bytes:req.body.length,...quality});return req.body as Buffer;}
 app.post(['/api/voices','/api/users/:user_id/embeddings'],raw,async(req,res)=>{
   requireVerified(req);if(req.headers['x-recording-consent']!=='yes')throw new Error('Recording consent required.');
   const variation=pitchVariation(req.query.pitch??req.query.variation??'normal'),key=owner(req),bytes=audio(req);
@@ -116,7 +125,7 @@ app.post(['/api/voices','/api/users/:user_id/embeddings'],raw,async(req,res)=>{
   const id=randomUUID();await store.saveAudio(key,id,bytes);
   try{await store.update(key,ws=>{if(req.params.user_id)requireUser(ws.profile,req.params.user_id);checkEmbeddingSlot(ws.profile,variation);ws.profile.voices.push({id,variation,createdAt:new Date().toISOString(),bytes:bytes.length,transcript,embedding:embedding.embedding,model:embedding.model});log(ws,'Voice enrolled',`${variation} sample saved; ${embedding?'speaker embedding generated':'speaker model unavailable'}.`);});}
   catch(error){await store.removeAudio(key,id);throw error;}
-  res.json(await state(key));
+  backendLog('voice.baseline_saved',{variation,authenticated:true});res.json(await state(key));
 });
 app.get('/api/voices/:id/audio',async(req,res)=>{requireVerified(req);const key=owner(req),id=z.string().uuid().parse(req.params.id);const ws=await store.get(key);if(!ws.profile.voices.some(v=>v.id===id)){res.status(404).json({error:'Recording not found.'});return;}const bytes=await store.audio(key,id);if(!bytes){res.sendStatus(404);return;}res.type('audio/wav').send(bytes);});
 app.delete('/api/voices/:id',async(req,res)=>{requireVerified(req);const key=owner(req),id=z.string().uuid().parse(req.params.id);await store.update(key,ws=>{ws.profile.voices=ws.profile.voices.filter(v=>v.id!==id);log(ws,'Voice sample deleted','Recording and derived embedding removed.');});await store.removeAudio(key,id);res.json(await state(key));});
@@ -204,6 +213,7 @@ const server=createServer(app);
 const vite=process.argv.includes('--dev')?await(await import('vite')).createServer({server:{middlewareMode:true,ws:{server}},appType:'spa'}):null;
 if(vite)app.use(vite.middlewares);else app.use(express.static(resolve('dist'),{dotfiles:'deny'}));
 app.use((error:unknown,_req:express.Request,res:express.Response,_next:express.NextFunction)=>{
+  backendLog('request.failed',{reason:error instanceof z.ZodError?'invalid_request':error instanceof ApiError?'api_rejection':error instanceof Error&&error.message.includes('consent')?'consent_required':error instanceof Error&&error.message.includes('challenge')?'challenge_missing_or_expired':error instanceof Error&&error.message.includes('Credential')?'credential_rejected':error instanceof Error&&error.message.includes('Passkey')?'passkey_rejected':error instanceof Error&&error.message.includes('baseline')?'baseline_unavailable':'validation_or_processing_failure',stage:_req.route?.path??'middleware'});
   const message=error instanceof z.ZodError?'Invalid request data.':error instanceof Error?error.message:'Request failed.';
   res.status(error instanceof ApiError?error.status:400).json({error:message});
 });

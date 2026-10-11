@@ -1,3 +1,4 @@
+import { backendLog } from './logger.ts';
 import { createHash, randomUUID } from 'node:crypto';
 import type { Workspace, Policy, RefundAction, Approval } from '../shared/types.ts';
 export const initialPolicy: Policy = { originalMethodOnly: false, maxRefundCents: 100000, requireApproval: false, version: 1 };
@@ -11,7 +12,7 @@ export function log(ws: Workspace, event: string, detail: string) { ws.audit.uns
 export function digest(action: RefundAction) {
   return createHash('sha256').update(JSON.stringify([action.id, action.orderId, action.amountCents, action.currency, action.destination, action.policyVersion, action.expiresAt, action.requiresVoice===true])).digest('hex');
 }
-export function checkRefund(ws: Workspace, action: RefundAction, now = Date.now()): string | null {
+function checkRefundResult(ws: Workspace, action: RefundAction, now = Date.now()): string | null {
   if(action.requiresVoice)return 'This retired bank request cannot execute. Create a new action request.';
   const order = ws.orders.find(o => o.id === action.orderId);
   if (!order?.eligible) return 'Order is not eligible for a refund.';
@@ -25,6 +26,12 @@ export function checkRefund(ws: Workspace, action: RefundAction, now = Date.now(
   if (ws.policy.originalMethodOnly && action.destination !== order.paymentMethod) return 'Refunds must return to the original payment method.';
   return null;
 }
+export function checkRefund(ws: Workspace, action: RefundAction, now = Date.now()): string | null {
+  const denial=checkRefundResult(ws,action,now);
+  // Denials are fixed server-defined strings, never supplied action parameters.
+  backendLog('security.refund_policy_checked',{status:denial?'denied':'allowed',reason:denial??'policy_passed'});
+  return denial;
+}
 export function executeRefund(ws: Workspace, actionId: string, approvalId: string, now = Date.now()): RefundAction {
   const action = ws.actions.find(a => a.id === actionId);
   if (!action) throw new Error('Action not found.');
@@ -33,6 +40,7 @@ export function executeRefund(ws: Workspace, actionId: string, approvalId: strin
   const approval = ws.approvals.find(a => a.id === approvalId && a.actionId === actionId);
   if (!approval || approval.used || Date.parse(approval.expiresAt) <= now) throw new Error('A fresh, unused passkey approval is required.');
   if (approval.digest !== digest(action) || approval.policyVersion !== ws.policy.version) throw new Error('Approved details changed. Request new approval.');
+  backendLog('security.refund_approval_verified',{status:'allowed'});
   approval.used = true; action.status = 'executed';
   ws.orders.find(o => o.id === action.orderId)!.refundedCents += action.amountCents;
   log(ws, 'Refund simulated', `$${(action.amountCents/100).toFixed(2)} · ${action.destination} · ${action.orderId}`);

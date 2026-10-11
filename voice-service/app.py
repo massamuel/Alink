@@ -4,6 +4,9 @@ from io import BytesIO
 import os
 import json
 import wave
+import logging
+import time
+import uuid
 from pathlib import Path
 from vosk import Model, KaldiRecognizer
 import numpy as np
@@ -28,6 +31,33 @@ async def lifespan(app):
     yield
 
 app = FastAPI(lifespan=lifespan)
+logger = logging.getLogger('alink.voice')
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler())
+logger.propagate = False
+
+@app.middleware('http')
+async def log_processing(request: Request, call_next):
+    supplied = request.headers.get('x-request-id', '')
+    try:
+        request_id = str(uuid.UUID(supplied))
+    except ValueError:
+        request_id = str(uuid.uuid4())
+    started = time.monotonic()
+    fields = {'requestId': request_id, 'method': request.method,
+              'route': request.url.path if request.url.path in ('/embed', '/transcribe', '/health') else 'unmatched'}
+    logger.info(json.dumps({'time': time.time(), 'event': 'voice.processing_started', **fields}))
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.info(json.dumps({'time': time.time(), 'event': 'voice.processing_failed', **fields,
+                               'reason': 'processing_exception', 'durationMs': round((time.monotonic()-started)*1000)}))
+        raise
+    logger.info(json.dumps({'time': time.time(), 'event': 'voice.processing_completed', **fields,
+                           'status': response.status_code, 'durationMs': round((time.monotonic()-started)*1000)}))
+    response.headers['X-Request-ID'] = request_id
+    return response
 
 @app.get('/health')
 def health():
